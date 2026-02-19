@@ -205,3 +205,36 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Dataset
+data/
+dataset/
+videos/
+*.mp4
+*.avi
+*.mov
+
+# Extracted frames 
+frames/
+preprocessed/
+
+# Trained models 
+models/
+*.h5
+*.keras
+*.pb
+*.ckpt
+*.pth
+*.pt
+checkpoints/
+
+# Temporary processing files
+temp/
+tmp/
+cache/
+
+# MediaPipe temp files
+.mediapipe/
+
+Thumbs.db
+desktop.ini
