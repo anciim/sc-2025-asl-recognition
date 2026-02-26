@@ -2,180 +2,205 @@ import os
 import sys
 import cv2
 import numpy as np
-import time
-from collections import deque
-
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hand_detection import create_hand_landmarker, detect_hand, detect_hand_fallback
+from preprocess import (
+    extract_frames, 
+    process_frame_with_hand_detection,
+    create_hand_landmarker,
+    scale_to_range,
+    CLASS_NAMES
+)
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODELS_DIR = os.path.join(BASE_DIR, "models")
-
-CLASS_NAMES = ["cat", "hello", "help", "more", "no",
-               "please", "sorry", "thank_you", "what", "yes"]
-NUM_CLASSES = len(CLASS_NAMES)
-IMG_SIZE = (224, 224)
-
-
-def load_cnn_model(model_path=None):
-    if model_path is None:
-        candidates = [
-            os.path.join(MODELS_DIR, "cnn_model_final.keras"),
-            os.path.join(MODELS_DIR, "cnn_model_finetuned.keras"),
-            os.path.join(MODELS_DIR, "cnn_model.keras"),
-            os.path.join(MODELS_DIR, "cnn_model_final.h5"),
-            os.path.join(MODELS_DIR, "cnn_model_finetuned.h5"),
-            os.path.join(MODELS_DIR, "cnn_model.h5"),
-        ]
-        model_path = next((p for p in candidates if os.path.exists(p)), None)
-        if model_path is None:
-            print("GRESKA: Model nije pronadjen!")
-            return None
-
-    print(f"Ucitavanje modela: {model_path}")
-    return load_model(model_path)
+CONFIDENCE_THRESHOLD = 0.3
+SEQ_LENGTH = 15
 
 
-def predict_frame(model, frame, landmarker, confidence_threshold=0.3):
-    hand_crop, landmarks, bbox = detect_hand(frame, landmarker, IMG_SIZE)
-
-    if hand_crop is None:
-        hand_crop, bbox_fallback = detect_hand_fallback(frame, IMG_SIZE)
-        if hand_crop is not None:
-            bbox = bbox_fallback
-
-    if hand_crop is None:
-        return None, 0.0, None
-
-    rgb = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2RGB)
-    preprocessed = preprocess_input(rgb.astype(np.float32))
-    batch = np.expand_dims(preprocessed, axis=0)
-
-    probs = model.predict(batch, verbose=0)[0]
-    pred_idx = np.argmax(probs)
-    confidence = probs[pred_idx]
-
-    if confidence < confidence_threshold:
-        return None, confidence, bbox
-
-    return CLASS_NAMES[pred_idx], confidence, bbox
-
-
-def run_webcam_demo(model_path=None, camera_id=0, confidence_threshold=0.3,
-                    window_size=10):
-    model = load_cnn_model(model_path)
-    if model is None:
-        return
-
-    print("Inicijalizacija MediaPipe HandLandmarker...")
-    landmarker = create_hand_landmarker(
-        min_detection_confidence=0.3,
-        min_presence_confidence=0.3
-    )
-
-    cap = cv2.VideoCapture(camera_id)
-    if not cap.isOpened():
-        print(f"GRESKA: Ne mogu otvoriti kameru (ID={camera_id})")
-        return
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    print("\n" + "=" * 50)
-    print("WEBCAM DEMO - ASL Recognition")
-    print("=" * 50)
-    print("Pritisnite 'q' za izlaz")
-    print("Pritisnite 's' za screenshot")
-    print("=" * 50 + "\n")
-
-    prediction_buffer = deque(maxlen=window_size)
-    fps_buffer = deque(maxlen=30)
-    frame_count = 0
-
-    while True:
-        start = time.time()
-
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame = cv2.flip(frame, 1)
-        display_frame = frame.copy()
-
-        label, confidence, bbox = predict_frame(
-            model, frame, landmarker, confidence_threshold
+class ASLRecognizer:
+    
+    def __init__(self, cnn_model_path=None, lstm_model_path=None):
+        self.class_names = CLASS_NAMES
+        
+        if cnn_model_path and os.path.exists(cnn_model_path):
+            print(f"Učitavam CNN model: {cnn_model_path}")
+            self.cnn_model = tf.keras.models.load_model(cnn_model_path)
+        else:
+            self.cnn_model = None
+            print("CNN model nije učitan")
+        
+        # Učitaj LSTM model (video sekvenca)
+        if lstm_model_path and os.path.exists(lstm_model_path):
+            print(f"Učitavam LSTM model: {lstm_model_path}")
+            self.lstm_model = tf.keras.models.load_model(lstm_model_path)
+        else:
+            self.lstm_model = None
+            print("LSTM model nije učitan")
+        
+        self.hand_landmarker = create_hand_landmarker(
+            min_detection_confidence=0.3,
+            min_presence_confidence=0.3
         )
+    
+    def predict_frame_by_frame(self, video_path):
+        if self.cnn_model is None:
+            return None, 0.0, []
+        
+        frames = extract_frames(video_path, target_fps=10, max_frames=30)
+        
+        if not frames:
+            return None, 0.0, []
+        
+        predictions = []
+        confidences = []
+        
+        for frame in frames:
+            hand_crop, _, _ = process_frame_with_hand_detection(
+                frame, self.hand_landmarker, target_size=(224, 224)
+            )
+            
+            if hand_crop is None:
+                continue
+            
+            rgb = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2RGB)
+            scaled = scale_to_range(rgb)
+            input_frame = np.expand_dims(scaled, axis=0)
+            
+            pred_probs = self.cnn_model.predict(input_frame, verbose=0)[0]
+            pred_class = np.argmax(pred_probs)
+            confidence = pred_probs[pred_class]
+            
+            if confidence >= CONFIDENCE_THRESHOLD:
+                predictions.append(pred_class)
+                confidences.append(confidence)
+        
+        if not predictions:
+            return None, 0.0, []
+        
+        vote_counts = Counter(predictions)
+        most_common_class, vote_count = vote_counts.most_common(1)[0]
+        
+        class_confidences = [
+            conf for pred, conf in zip(predictions, confidences) 
+            if pred == most_common_class
+        ]
+        avg_confidence = np.mean(class_confidences)
+        
+        return most_common_class, avg_confidence, predictions
+    
+    def predict_video_sequence(self, video_path):
+        if self.lstm_model is None:
+            return None, 0.0
+        
+        frames = extract_frames(video_path, target_fps=10, max_frames=30)
+        
+        if not frames:
+            return None, 0.0
+        
+        processed_frames = []
+        for frame in frames:
+            hand_crop, _, _ = process_frame_with_hand_detection(
+                frame, self.hand_landmarker, target_size=(224, 224)
+            )
+            
+            if hand_crop is not None:
+                rgb = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2RGB)
+                scaled = scale_to_range(rgb)
+                processed_frames.append(scaled)
+        
+        if not processed_frames:
+            return None, 0.0
+        
+        if len(processed_frames) >= SEQ_LENGTH:
+            indices = np.linspace(0, len(processed_frames) - 1, SEQ_LENGTH, dtype=int)
+            sequence = [processed_frames[i] for i in indices]
+        else:
+            sequence = processed_frames + [processed_frames[-1]] * (SEQ_LENGTH - len(processed_frames))
+        
+        sequence_array = np.array([sequence]) 
+        
+        pred_probs = self.lstm_model.predict(sequence_array, verbose=0)[0]
+        pred_class = np.argmax(pred_probs)
+        confidence = pred_probs[pred_class]
+        
+        return pred_class, confidence
+    
+    def predict(self, video_path, method='both'):
+        results = {}
+        
+        if method in ['cnn', 'both'] and self.cnn_model is not None:
+            print("\n[CNN] Frame-by-frame + Majority Voting...")
+            pred_class, confidence, all_preds = self.predict_frame_by_frame(video_path)
+            
+            if pred_class is not None:
+                results['cnn'] = {
+                    'class': self.class_names[pred_class],
+                    'class_idx': int(pred_class),
+                    'confidence': float(confidence),
+                    'num_frames': len(all_preds)
+                }
+                print(f"  Rezultat: {self.class_names[pred_class]} (confidence: {confidence:.3f})")
+            else:
+                results['cnn'] = None
+                print("  Nema validinih predikcija")
+        
+        if method in ['lstm', 'both'] and self.lstm_model is not None:
+            print("\n[LSTM] Video sekvenca...")
+            pred_class, confidence = self.predict_video_sequence(video_path)
+            
+            if pred_class is not None:
+                results['lstm'] = {
+                    'class': self.class_names[pred_class],
+                    'class_idx': int(pred_class),
+                    'confidence': float(confidence)
+                }
+                print(f"  Rezultat: {self.class_names[pred_class]} (confidence: {confidence:.3f})")
+            else:
+                results['lstm'] = None
+                print("  Nema validinih predikcija")
+        
+        return results
+    
+    def __del__(self):
+        if hasattr(self, 'hand_landmarker'):
+            self.hand_landmarker.close()
 
-        if label is not None:
-            prediction_buffer.append(label)
 
-        if bbox is not None:
-            x, y, w, h = bbox
-            color = (0, 255, 0) if label else (0, 165, 255)
-            cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
-
-        if prediction_buffer:
-            from collections import Counter
-            vote_counts = Counter(prediction_buffer)
-            final_label, count = vote_counts.most_common(1)[0]
-            vote_confidence = count / len(prediction_buffer)
-
-            text = f"{final_label} ({vote_confidence:.0%})"
-            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
-
-            cv2.rectangle(display_frame, (10, 10), (20 + text_size[0], 20 + text_size[1] + 10),
-                          (0, 0, 0), -1)
-            cv2.putText(display_frame, text, (15, 15 + text_size[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-        if label is not None:
-            conf_text = f"Frame: {label} ({confidence:.2f})"
-            cv2.putText(display_frame, conf_text, (10, display_frame.shape[0] - 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        elapsed = time.time() - start
-        fps_buffer.append(1.0 / max(elapsed, 1e-6))
-        avg_fps = np.mean(fps_buffer)
-        cv2.putText(display_frame, f"FPS: {avg_fps:.1f}", (10, display_frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-        cv2.imshow("ASL Recognition", display_frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("s"):
-            screenshot_path = os.path.join(BASE_DIR, f"screenshot_{frame_count}.png")
-            cv2.imwrite(screenshot_path, display_frame)
-            print(f"Screenshot sacuvan: {screenshot_path}")
-
-        frame_count += 1
-
-    cap.release()
-    cv2.destroyAllWindows()
-    landmarker.close()
-    print(f"\nZavrseno. Obradjeno {frame_count} frejmova.")
+def main():
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    models_dir = os.path.join(base_dir, "models")
+    
+    cnn_model_path = os.path.join(models_dir, "cnn_model_final.keras")
+    lstm_model_path = os.path.join(models_dir, "lstm_model.keras")
+    
+    recognizer = ASLRecognizer(
+        cnn_model_path=cnn_model_path,
+        lstm_model_path=lstm_model_path
+    )
+    
+    test_video = os.path.join(base_dir, "data", "hello", "27172.mp4")
+    
+    if os.path.exists(test_video):
+        print(f"\nTest video: {test_video}")
+        print("=" * 60)
+        
+        results = recognizer.predict(test_video, method='both')
+        
+        print("\n" + "=" * 60)
+        print("REZULTATI:")
+        print("=" * 60)
+        
+        if 'cnn' in results and results['cnn']:
+            print(f"CNN:  {results['cnn']['class']} ({results['cnn']['confidence']:.2%})")
+        
+        if 'lstm' in results and results['lstm']:
+            print(f"LSTM: {results['lstm']['class']} ({results['lstm']['confidence']:.2%})")
+        
+        print("=" * 60)
+    else:
+        print(f"Test video ne postoji: {test_video}")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="ASL Recognition - Webcam Demo")
-    parser.add_argument("--model", type=str, default=None)
-    parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--threshold", type=float, default=0.3)
-    parser.add_argument("--window", type=int, default=10,
-                        help="Velicina prozora za majority voting")
-
-    args = parser.parse_args()
-
-    run_webcam_demo(
-        model_path=args.model,
-        camera_id=args.camera,
-        confidence_threshold=args.threshold,
-        window_size=args.window
-    )
+    main()
